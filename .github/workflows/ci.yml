@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate Zsh syntax
+        run: |
+          zsh -n bin/macos-system-data
+          zsh -n tests/test_cli.sh
+
+      - name: Run Test Suite
+        run: |
+          chmod +x bin/macos-system-data tests/test_cli.sh
+          ./tests/test_cli.sh
