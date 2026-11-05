@@ -1,16 +1,21 @@
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
+APP_NAME := MacOS Storage Optimiser
+APP := dist/$(APP_NAME).app
 
-.PHONY: all lint test install uninstall help
+.PHONY: all lint test test-app app run install uninstall help
 
 all: help
 
 help:
 	@echo "macos-system-data build & installation targets:"
-	@echo "  make test      - Run automated CLI test suite"
+	@echo "  make test      - Run automated CLI + JSON contract test suite"
+	@echo "  make test-app  - Run Swift unit tests for the desktop app"
 	@echo "  make lint      - Validate zsh script syntax"
-	@echo "  make install   - Install binary into $(BINDIR)"
-	@echo "  make uninstall - Remove binary from $(BINDIR)"
+	@echo "  make app       - Build the desktop app into dist/"
+	@echo "  make run       - Build and launch the desktop app"
+	@echo "  make install   - Install CLI binary into $(BINDIR)"
+	@echo "  make uninstall - Remove CLI binary from $(BINDIR)"
 
 lint:
 	zsh -n bin/macos-system-data
@@ -18,6 +23,15 @@ lint:
 
 test: lint
 	./tests/test_cli.sh
+
+test-app:
+	swift test --package-path app
+
+app:
+	./scripts/build-app.sh
+
+run: app
+	open "$(APP)"
 
 install:
 	@mkdir -p $(BINDIR)

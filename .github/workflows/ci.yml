@@ -17,7 +17,22 @@ jobs:
           zsh -n bin/macos-system-data
           zsh -n tests/test_cli.sh
 
-      - name: Run Test Suite
+      - name: Run CLI test suite
         run: |
           chmod +x bin/macos-system-data tests/test_cli.sh
           ./tests/test_cli.sh
+
+      - name: Run Swift tests
+        run: swift test --package-path app
+
+      - name: Build desktop app
+        run: |
+          chmod +x scripts/build-app.sh scripts/make-icon.swift
+          ./scripts/build-app.sh
+
+      - name: Upload app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MacOS-Storage-Optimiser-app
+          path: dist/MacOS Storage Optimiser.app
+          if-no-files-found: error

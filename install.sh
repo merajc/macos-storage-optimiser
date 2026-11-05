@@ -2,7 +2,7 @@
 set -euo pipefail
 
 INSTALL_DIR="${HOME}/.local/bin"
-RAW_URL="https://raw.githubusercontent.com/merajc/macos-system-data/main/bin/macos-system-data"
+RAW_URL="https://raw.githubusercontent.com/merajc/macos-storage-optimiser/main/bin/macos-system-data"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
     echo "Error: macos-system-data is designed exclusively for macOS." >&2

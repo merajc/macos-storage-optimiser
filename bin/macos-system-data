@@ -8,14 +8,21 @@
 #  - Heavy virtual disks & application caches (BlueStacks, Adobe Camera Raw, etc.)
 #  - APFS local snapshots, system swap, and Spotlight large file inspection
 #
-# Repository: https://github.com/merajc/macos-system-data
+# Machine interface (v1.1+):
+#  --json           Streams newline-delimited JSON (NDJSON) for agents and GUIs
+#  --clean-ids      Cleans only known catalog IDs, still guarded by safe_remove
+#
+# Repository: https://github.com/merajc/macos-storage-optimiser
 # License: MIT
 # ==============================================================================
 
-# Strict error trapping for unexpected signals
-trap 'echo -e "\nOperation cancelled by user."; exit 130' INT TERM
+# Cancellation notices go to stderr so JSON stdout stays parseable.
+trap 'echo -e "\nOperation cancelled by user." >&2; exit 130' INT TERM
 
-VERSION="1.0.0"
+VERSION="1.1.0"
+
+# Keep local/typeset re-declarations quiet (zsh prints values otherwise).
+setopt TYPESET_SILENT
 
 # Guard: Exclusively macOS
 if [[ "$(uname -s)" != "Darwin" ]]; then
@@ -31,15 +38,19 @@ MODE="audit"
 FORCE=0
 DRY_RUN=0
 NO_COLOR_FLAG=0
+JSON_MODE=0
+CLEAN_IDS=""
 TOTAL_RECLAIMED_KB=0
+CLEAN_FAILURES=0
+LAST_ERROR=""
 
 # Check for NO_COLOR standard (https://no-color.org)
 if [[ -n "${NO_COLOR:-}" || ! -t 1 ]]; then
     NO_COLOR_FLAG=1
 fi
 
-for arg in "$@"; do
-    case "$arg" in
+while (( $# > 0 )); do
+    case "$1" in
         --audit)
             MODE="audit"
             ;;
@@ -58,6 +69,23 @@ for arg in "$@"; do
         --clean-all)
             MODE="clean-all"
             ;;
+        --clean-ids)
+            shift
+            if (( $# == 0 )); then
+                echo "Error: --clean-ids requires a comma-separated list of item IDs" >&2
+                exit 2
+            fi
+            CLEAN_IDS="$1"
+            MODE="clean-ids"
+            ;;
+        --clean-ids=*)
+            CLEAN_IDS="${1#*=}"
+            MODE="clean-ids"
+            ;;
+        --json)
+            JSON_MODE=1
+            NO_COLOR_FLAG=1
+            ;;
         --dry-run|-n)
             DRY_RUN=1
             ;;
@@ -75,11 +103,12 @@ for arg in "$@"; do
             MODE="help"
             ;;
         *)
-            echo "Error: Unknown option '$arg'" >&2
+            echo "Error: Unknown option '$1'" >&2
             echo "Run 'macos-system-data --help' for usage." >&2
             exit 2
             ;;
     esac
+    shift
 done
 
 # Colors & Formatting setup
@@ -119,6 +148,8 @@ ${BOLD}OPTIONS:${RESET}
   --clean-tier1       Clean safe temporary bugs (Chrome/Teams code-sign clones, App Store staging)
   --clean-dev         Clean developer & package caches (NPM, NPX, Brew, Playwright, Xcode, Pip)
   --clean-all         Clean Tier 1 + Tier 2, and prompt for Tier 3 virtual disks
+  --clean-ids <ids>   Clean only the given comma-separated item IDs (needs -y, or -n to preview)
+  --json              Machine-readable NDJSON output for agents/GUIs (no color, no prompts)
   -n, --dry-run       Simulate deletions without modifying files on disk
   -y, --force         Skip interactive confirmation prompts
   --no-color          Disable ANSI color formatting
@@ -126,10 +157,17 @@ ${BOLD}OPTIONS:${RESET}
   -h, --help          Show this help message
 
 ${BOLD}EXAMPLES:${RESET}
-  macos-system-data                   # Comprehensive read-only audit
-  macos-system-data --dry-run --clean # Preview what interactive clean would do
-  macos-system-data --clean-tier1 -y  # Immediately purge runaway updater clone bugs
-  macos-system-data --clean-dev       # Reclaim space from developer build artifacts
+  macos-system-data                        # Comprehensive read-only audit
+  macos-system-data --json                 # Same audit, NDJSON for tooling
+  macos-system-data --json --clean-ids xcode-deriveddata -y
+  macos-system-data --dry-run --clean      # Preview what interactive clean would do
+  macos-system-data --clean-tier1 -y       # Immediately purge runaway updater clone bugs
+  macos-system-data --clean-dev            # Reclaim space from developer build artifacts
+
+${BOLD}EXIT CODES:${RESET}
+  0  Success
+  2  Usage error (unknown flag, unknown/invalid item ID, prompts required but --json set)
+  3  Cleanup ran but one or more items could not be removed
 EOF
     exit 0
 fi
@@ -178,10 +216,34 @@ format_kb() {
     fi
 }
 
+# Human output is suppressed in JSON mode so stdout stays machine-readable.
+say() {
+    if [[ $JSON_MODE -eq 0 ]]; then
+        echo -e "$@"
+    fi
+}
+
+json_escape() {
+    local s="$1"
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    s=${s//$'\n'/\\n}
+    s=${s//$'\r'/\\r}
+    s=${s//$'\t'/\\t}
+    print -r -- "$s"
+}
+
+bool() {
+    if [[ "$1" -eq 1 ]]; then echo "true"; else echo "false"; fi
+}
+
 confirm_action() {
     local prompt_msg="$1"
     if [[ $FORCE -eq 1 ]]; then
         return 0
+    fi
+    if [[ $JSON_MODE -eq 1 ]]; then
+        return 1
     fi
     echo -ne "${YELLOW}${prompt_msg} [y/N]: ${RESET}"
     read -r response
@@ -201,7 +263,8 @@ safe_remove() {
     local desc="$2"
 
     if [[ -z "$target" ]]; then
-        echo -e "  ${RED}✘ Blocked empty path deletion${RESET}"
+        say "  ${RED}✘ Blocked empty path deletion${RESET}"
+        LAST_ERROR="Blocked empty path"
         return 1
     fi
 
@@ -215,7 +278,8 @@ safe_remove() {
     # Critical blacklist check
     case "$canonical" in
         ""|"/"|"/System"*|"/Library"*|"/usr"*|"/bin"*|"/sbin"*|"/var"|"/private"|"/Users"|"/Users/"|"/Users/Shared"|"/Users/Shared/"|"$HOME"|"$HOME/"|"$HOME/Library"|"$HOME/Library/"|"$HOME/Desktop"*|"$HOME/Documents"*|"$HOME/Downloads"*)
-            echo -e "  ${RED}✘ Blocked unsafe deletion of protected path:${RESET} '${canonical}'"
+            say "  ${RED}✘ Blocked unsafe deletion of protected path:${RESET} '${canonical}'"
+            LAST_ERROR="Blocked protected path"
             return 1
             ;;
     esac
@@ -247,7 +311,8 @@ safe_remove() {
     done
 
     if [[ $is_allowed -ne 1 ]]; then
-        echo -e "  ${RED}✘ Blocked deletion: path is outside verified purge roots:${RESET} '${canonical}'"
+        say "  ${RED}✘ Blocked deletion: path is outside verified purge roots:${RESET} '${canonical}'"
+        LAST_ERROR="Blocked outside purge roots"
         return 1
     fi
 
@@ -257,401 +322,665 @@ safe_remove() {
     sz_human=$(format_kb "$sz_kb")
 
     if [[ $DRY_RUN -eq 1 ]]; then
-        echo -e "  ${YELLOW}[DRY RUN] Would clean:${RESET} ${desc} (${sz_human})"
+        say "  ${YELLOW}[DRY RUN] Would clean:${RESET} ${desc} (${sz_human})"
         TOTAL_RECLAIMED_KB=$(( TOTAL_RECLAIMED_KB + sz_kb ))
         return 0
     fi
 
     rm -rf "$canonical" 2>/dev/null
     if [[ ! -e "$canonical" ]]; then
-        echo -e "  ${GREEN}✔ Cleaned:${RESET} ${desc} (${sz_human} reclaimed)"
+        say "  ${GREEN}✔ Cleaned:${RESET} ${desc} (${sz_human} reclaimed)"
         TOTAL_RECLAIMED_KB=$(( TOTAL_RECLAIMED_KB + sz_kb ))
         return 0
     else
-        echo -e "  ${RED}✘ Permission denied:${RESET} ${desc} (may require Full Disk Access or root)"
+        say "  ${RED}✘ Permission denied:${RESET} ${desc} (may require Full Disk Access or root)"
+        LAST_ERROR="Permission denied"
         return 1
     fi
 }
 
-show_summary() {
-    echo -e "${BOLD}${CYAN}=== macOS Storage Capacity Overview ===${RESET}"
-    df -h /System/Volumes/Data 2>/dev/null | tail -n 1 | awk '{printf "  Disk: %s | Used: %s | Available: %s (%s utilized)\n", $2, $3, $4, $5}'
+# ------------------------------------------------------------------------------
+# Item Catalog
+#
+# Single source of truth for both the human audit and the JSON contract. Add an
+# entry here and it shows up in the CLI, the JSON stream, and the GUI.
+# ------------------------------------------------------------------------------
+typeset -ga CATALOG_IDS=()
+typeset -gA CAT_TIER CAT_SAFETY CAT_LABEL CAT_CLEANABLE CAT_HANDLER CAT_TEXT_PATH CAT_PATHS
+typeset -gA CAT_NOTE
+DU_ERR_FILE="$(mktemp -t macos-system-data.XXXXXX 2>/dev/null || echo "/tmp/macos-system-data.$$")"
+trap 'rm -f "${DU_ERR_FILE}"' EXIT
+
+add_item() {
+    local id="$1" tier="$2" safety="$3" label="$4" cleanable="$5" handler="$6" text_path="$7" note="$8"
+    CATALOG_IDS+=("$id")
+    CAT_TIER[$id]="$tier"
+    CAT_SAFETY[$id]="$safety"
+    CAT_LABEL[$id]="$label"
+    CAT_CLEANABLE[$id]="$cleanable"
+    CAT_HANDLER[$id]="$handler"
+    CAT_TEXT_PATH[$id]="$text_path"
+    CAT_NOTE[$id]="$note"
+    CAT_PATHS[$id]=""
 }
 
-if [[ "$MODE" == "summary" ]]; then
-    show_summary
-    exit 0
-fi
+set_item_paths() {
+    local id="$1"
+    shift
+    CAT_PATHS[$id]="${(pj:\n:)@}"
+}
+
+build_catalog() {
+    local -a clones=()
+    [[ -d "$DARWIN_DIR_X" ]] && clones=("$DARWIN_DIR_X"/*.code_sign_clone(N))
+
+    add_item "code-sign-clones" 1 "safe" "Chromium / Electron Code-Sign Clones" 1 "clones" "" \
+        "Runaway updater clones left behind by Chromium/Electron apps"
+    set_item_paths "code-sign-clones" "${clones[@]}"
+
+    add_item "appstore-staging" 1 "safe" "App Store Download Staging" 1 "paths" "" \
+        "Stranded App Store package downloads"
+    set_item_paths "appstore-staging" "${DARWIN_DIR_C}/com.apple.appstoreagent"
+
+    add_item "npm-cache" 2 "safe" "NPM & NPX Cache" 1 "paths" "~/.npm" \
+        "Downloaded package tarballs and npx binaries; re-downloaded on demand"
+    set_item_paths "npm-cache" "$HOME/.npm/_cacache" "$HOME/.npm/_npx"
+
+    add_item "brew-cache" 2 "safe" "Homebrew Bottle Cache" 1 "paths" "" \
+        "Downloaded bottles; Homebrew re-downloads them when needed"
+    set_item_paths "brew-cache" "$HOME/Library/Caches/Homebrew"
+
+    add_item "playwright" 2 "safe" "Playwright Browser Binaries" 1 "paths" "" \
+        "Browser builds fetched by Playwright; reinstall with playwright install"
+    set_item_paths "playwright" "$HOME/Library/Caches/ms-playwright" "$HOME/Library/Caches/ms-playwright-go"
+
+    add_item "dotslash" 2 "safe" "DotSlash Executable Binaries" 1 "paths" "" \
+        "Cached tool binaries fetched by DotSlash"
+    set_item_paths "dotslash" "$HOME/Library/Caches/dotslash"
+
+    add_item "pip" 2 "safe" "Python Pip Cache" 1 "paths" "" \
+        "Downloaded Python wheels; pip re-downloads them on demand"
+    set_item_paths "pip" "$HOME/Library/Caches/pip"
+
+    add_item "xcode-deriveddata" 2 "safe" "Xcode DerivedData" 1 "paths" "" \
+        "Xcode build products and indexes; regenerated on next build"
+    set_item_paths "xcode-deriveddata" "$HOME/Library/Developer/Xcode/DerivedData"
+
+    add_item "sim-caches" 2 "safe" "iOS Simulator Caches" 1 "paths" "" \
+        "Simulator runtime caches; regenerated on next launch"
+    set_item_paths "sim-caches" "$HOME/Library/Developer/CoreSimulator/Caches"
+
+    add_item "gradle" 2 "safe" "Gradle Cache" 1 "paths" "" \
+        "Gradle dependency cache; re-downloaded on next build"
+    set_item_paths "gradle" "$HOME/.gradle/caches"
+
+    add_item "yarn" 2 "safe" "Yarn Cache" 1 "paths" "" \
+        "Yarn package cache; re-downloaded on next install"
+    set_item_paths "yarn" "$HOME/Library/Caches/Yarn"
+
+    add_item "cocoapods" 2 "safe" "CocoaPods Cache" 1 "paths" "" \
+        "Pod tarballs; re-downloaded on next pod install"
+    set_item_paths "cocoapods" "$HOME/Library/Caches/CocoaPods"
+
+    add_item "bluestacks" 3 "review" "BlueStacks Android VM Disk" 1 "paths" "" \
+        "Android emulator virtual disk; deleting removes installed apps and data"
+    set_item_paths "bluestacks" "/Users/Shared/Library/Application Support/BlueStacks"
+
+    add_item "adobe-raw" 3 "review" "Adobe Camera Raw Preview Caches" 1 "paths" "" \
+        "Camera Raw preview databases; rebuilt as you browse photos"
+    set_item_paths "adobe-raw" "$HOME/Library/Caches/Adobe Camera Raw 2" \
+        "$HOME/Library/Caches/Adobe Camera Raw BigTableGroupCache"
+
+    add_item "diagnostic-reports" 3 "review" "Diagnostic Crash Reports" 1 "paths" "" \
+        "Crash and spin reports written by macOS"
+    set_item_paths "diagnostic-reports" "$HOME/Library/Logs/DiagnosticReports"
+
+    add_item "trash" 3 "review" "User Trash Bin" 1 "trash" "" \
+        "Files you already moved to the Trash"
+    set_item_paths "trash" "$HOME/.Trash"
+
+    add_item "prime-video-container" 3 "review" "Leftover Prime Video Container" 1 "paths" "" \
+        "Container left behind by Amazon Prime Video"
+    set_item_paths "prime-video-container" "$HOME/Library/Containers/com.amazon.aiv.AIVApp"
+}
+
+build_catalog
+
+# Measure an item: sets ITEM_KB (1K blocks) and ITEM_DENIED (1 when unreadable).
+measure_item() {
+    local id="$1" p kb_raw kb
+    ITEM_KB=0
+    ITEM_DENIED=0
+    for p in ${(f)CAT_PATHS[$id]}; do
+        [[ -n "$p" && -e "$p" ]] || continue
+        if [[ -d "$p" && ! -r "$p" ]]; then
+            ITEM_DENIED=1
+            continue
+        fi
+        : > "$DU_ERR_FILE" 2>/dev/null
+        kb_raw=$(du -sk "$p" 2>"$DU_ERR_FILE")
+        if [[ -s "$DU_ERR_FILE" ]] && grep -qE 'Operation not permitted|Permission denied' "$DU_ERR_FILE" 2>/dev/null; then
+            ITEM_DENIED=1
+        fi
+        kb="${kb_raw%%[[:space:]]*}"
+        [[ "$kb" == <-> ]] || kb=0
+        ITEM_KB=$(( ITEM_KB + kb ))
+    done
+}
+
+item_state() {
+    local id="$1" p exists=0
+    for p in ${(f)CAT_PATHS[$id]}; do
+        [[ -n "$p" && -e "$p" ]] && exists=1
+    done
+    if (( ! exists )); then
+        echo "missing"
+    elif (( ITEM_DENIED )); then
+        echo "denied"
+    else
+        echo "present"
+    fi
+}
+
+item_display_path() {
+    local id="$1" p="${CAT_TEXT_PATH[$id]}"
+    if [[ -z "$p" ]]; then
+        local -a item_paths=(${(f)CAT_PATHS[$id]})
+        p="${item_paths[1]}"
+    fi
+    [[ -n "$p" ]] && p="${p/#$HOME/~}"
+    print -r -- "$p"
+}
+
+# Returns 0 when the path is (inside) a catalogued item's path.
+is_catalogued_path() {
+    local path="$1" id p
+    for id in "${CATALOG_IDS[@]}"; do
+        for p in ${(f)CAT_PATHS[$id]}; do
+            [[ -n "$p" ]] || continue
+            if [[ "$path" == "$p" || "$path" == "$p"/* ]]; then
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
+show_summary() {
+    say "${BOLD}${CYAN}=== macOS Storage Capacity Overview ===${RESET}"
+    say "  $(df -h /System/Volumes/Data 2>/dev/null | tail -n 1 | awk '{printf "Disk: %s | Used: %s | Available: %s (%s utilized)", $2, $3, $4, $5}')"
+}
+
+# ------------------------------------------------------------------------------
+# JSON emitters
+# ------------------------------------------------------------------------------
+
+json_meta() {
+    local mode="$1"
+    print -r -- "{\"type\":\"meta\",\"schema\":1,\"version\":\"${VERSION}\",\"mode\":\"${mode}\",\"platform\":\"macOS\",\"darwinBase\":\"$(json_escape "${DARWIN_USER_BASE}")\",\"generatedAt\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+}
+
+json_disk() {
+    local line fs total used avail cap mnt
+    line=$(df -k /System/Volumes/Data 2>/dev/null | tail -n 1)
+    read -r fs total used avail cap mnt <<< "$line"
+    cap="${cap%%\%}"
+    [[ "$total" == <-> ]] || total=0
+    [[ "$used" == <-> ]] || used=0
+    [[ "$avail" == <-> ]] || avail=0
+    [[ "$cap" == <-> ]] || cap=0
+    print -r -- "{\"type\":\"disk\",\"totalBytes\":$(( total * 1024 )),\"usedBytes\":$(( used * 1024 )),\"freeBytes\":$(( avail * 1024 )),\"usedPercent\":${cap}}"
+}
+
+json_paths() {
+    local id="$1" p out="" first=1
+    for p in ${(f)CAT_PATHS[$id]}; do
+        [[ -n "$p" ]] || continue
+        if (( first )); then first=0; else out+=","; fi
+        out+="\"$(json_escape "$p")\""
+    done
+    print -r -- "[${out}]"
+}
+
+json_item() {
+    local id="$1"
+    measure_item "$id"
+    local state
+    state=$(item_state "$id")
+    local count=0 p
+    for p in ${(f)CAT_PATHS[$id]}; do
+        [[ -n "$p" && -e "$p" ]] && count=$(( count + 1 ))
+    done
+    print -r -- "{\"type\":\"item\",\"id\":\"${id}\",\"tier\":${CAT_TIER[$id]},\"safety\":\"${CAT_SAFETY[$id]}\",\"label\":\"$(json_escape "${CAT_LABEL[$id]}")\",\"note\":\"$(json_escape "${CAT_NOTE[$id]}")\",\"state\":\"${state}\",\"bytes\":$(( ITEM_KB * 1024 )),\"count\":${count},\"cleanable\":$(bool "${CAT_CLEANABLE[$id]}"),\"paths\":$(json_paths "$id")}"
+}
+
+json_insight() {
+    local kind="$1" id="$2" label="$3" bytes="$4" path="$5" extra="$6"
+    print -r -- "{\"type\":\"insight\",\"kind\":\"${kind}\",\"id\":\"${id}\",\"label\":\"$(json_escape "$label")\",\"bytes\":${bytes},\"path\":\"$(json_escape "$path")\"${extra}}"
+}
+
+json_clean() {
+    local id="$1" result="$2" bytes="$3" message="$4"
+    [[ $JSON_MODE -eq 1 ]] || return 0
+    print -r -- "{\"type\":\"clean\",\"id\":\"${id}\",\"label\":\"$(json_escape "${CAT_LABEL[$id]}")\",\"status\":\"${result}\",\"bytes\":$(( bytes * 1024 )),\"message\":\"$(json_escape "$message")\"}"
+}
+
+json_done_audit() {
+    local reclaim_kb="$1" items="$2" elapsed_ms="$3"
+    print -r -- "{\"type\":\"done\",\"reclaimableBytes\":$(( reclaim_kb * 1024 )),\"reclaimableItems\":${items},\"elapsedMs\":${elapsed_ms}}"
+}
+
+json_done_clean() {
+    local reclaimed_kb="$1" failures="$2"
+    local result="ok"
+    (( failures > 0 )) && result="partial"
+    print -r -- "{\"type\":\"done\",\"reclaimedBytes\":$(( reclaimed_kb * 1024 )),\"status\":\"${result}\",\"failures\":${failures}}"
+}
 
 # ------------------------------------------------------------------------------
 # AUDIT MODE
 # ------------------------------------------------------------------------------
 
-run_audit() {
-    show_summary
-    echo ""
-    echo -e "${BOLD}${CYAN}Auditing System Data Culprits...${RESET}"
-    if [[ -n "$DARWIN_USER_BASE" ]]; then
-        echo -e "${DIM}Darwin base resolved to: ${DARWIN_USER_BASE}${RESET}"
-    fi
-    echo ""
+clone_label() {
+    local clone="$1"
+    basename "$clone" | sed 's/\.code_sign_clone//; s/^com\.[^.]*\.//'
+}
 
-    # Tier 1: Runaway Bugs
-    echo -e "${BOLD}--- [Tier 1: Stranded OS & App Bug Dumps (100% Safe to Clean)] ---${RESET}"
-    local active_clones=0
-    if [[ -d "$DARWIN_DIR_X" ]]; then
-        while IFS= read -r clone; do
-            [[ -z "$clone" ]] && continue
-            local clone_kb=$(get_size_kb "$clone")
-            if [[ $clone_kb -gt 0 ]]; then
-                active_clones=$(( active_clones + 1 ))
-                local clone_sz=$(get_size "$clone")
-                local app_name=$(basename "$clone" | sed 's/\.code_sign_clone//; s/^com\.[^.]*\.//')
-                echo -e "  ${RED}! Runaway Code-Sign Clones (${app_name}):${RESET} ${BOLD}${clone_sz}${RESET} (${clone})"
+print_item_line() {
+    local id="$1"
+    measure_item "$id"
+    local state kb label disp
+    state=$(item_state "$id")
+    kb=$ITEM_KB
+    label="${CAT_LABEL[$id]}"
+    disp=$(item_display_path "$id")
+
+    if [[ "$state" == "denied" ]]; then
+        say "  ${RED}✘ ${label}:${RESET} permission denied (${disp})"
+        return
+    fi
+    if [[ "$state" == "missing" || $kb -eq 0 ]]; then
+        say "  ${GREEN}✔ ${label}:${RESET} Clean (0B)"
+    else
+        say "  ${YELLOW}! ${label}:${RESET} ${BOLD}$(format_kb "$kb")${RESET} (${disp})"
+    fi
+}
+
+run_audit_json() {
+    json_meta "audit"
+    json_disk
+
+    local id reclaim_kb=0 reclaim_items=0
+    for id in "${CATALOG_IDS[@]}"; do
+        json_item "$id"
+        if [[ ${CAT_CLEANABLE[$id]} -eq 1 ]]; then
+            # Reuse the measurement performed by json_item.
+            local st
+            st=$(item_state "$id")
+            if [[ "$st" == "present" && $ITEM_KB -gt 0 ]]; then
+                reclaim_kb=$(( reclaim_kb + ITEM_KB ))
+                reclaim_items=$(( reclaim_items + 1 ))
             fi
-        done < <(find "$DARWIN_DIR_X" -maxdepth 1 -name "*.code_sign_clone" 2>/dev/null)
-    fi
+        fi
+    done
 
-    if [[ $active_clones -eq 0 ]]; then
-        echo -e "  ${GREEN}✔ Chromium / Electron Code-Sign Clones:${RESET} Clean (0B)"
-    fi
-
-    local appstore="${DARWIN_DIR_C}/com.apple.appstoreagent"
-    local appstore_sz=$(get_size "$appstore")
-    if [[ "$appstore_sz" != "0B" ]]; then
-        echo -e "  ${YELLOW}! App Store Download Staging:${RESET} ${BOLD}${appstore_sz}${RESET} (${appstore})"
-    else
-        echo -e "  ${GREEN}✔ App Store Download Staging:${RESET} Clean (0B)"
-    fi
-
-    echo ""
-
-    # Tier 2: Developer & Package Manager Caches
-    echo -e "${BOLD}--- [Tier 2: Developer & Package Manager Caches] ---${RESET}"
-
-    # NPM
-    local npm_sz="0B"
-    if [[ -d "$HOME/.npm/_cacache" || -d "$HOME/.npm/_npx" ]]; then
-        npm_sz=$(get_size "$HOME/.npm")
-        echo -e "  ${YELLOW}! NPM & NPX Cache:${RESET} ${BOLD}${npm_sz}${RESET} (~/.npm)"
-    else
-        echo -e "  ${GREEN}✔ NPM & NPX Cache:${RESET} Clean (0B)"
-    fi
-
-    # Homebrew
-    local brew_cache="$HOME/Library/Caches/Homebrew"
-    local brew_sz=$(get_size "$brew_cache")
-    if [[ "$brew_sz" != "0B" ]]; then
-        echo -e "  ${YELLOW}! Homebrew Bottle Cache:${RESET} ${BOLD}${brew_sz}${RESET} (${brew_cache})"
-    else
-        echo -e "  ${GREEN}✔ Homebrew Bottle Cache:${RESET} Clean (0B)"
-    fi
-
-    # Playwright
-    local pw_cache="$HOME/Library/Caches/ms-playwright"
-    local pw_sz=$(get_size "$pw_cache")
-    if [[ "$pw_sz" != "0B" ]]; then
-        echo -e "  ${YELLOW}! Playwright Browser Binaries:${RESET} ${BOLD}${pw_sz}${RESET} (${pw_cache})"
-    else
-        echo -e "  ${GREEN}✔ Playwright Browser Binaries:${RESET} Clean (0B)"
-    fi
-
-    # DotSlash
-    local ds_cache="$HOME/Library/Caches/dotslash"
-    local ds_sz=$(get_size "$ds_cache")
-    if [[ "$ds_sz" != "0B" ]]; then
-        echo -e "  ${YELLOW}! DotSlash Executable Binaries:${RESET} ${BOLD}${ds_sz}${RESET} (${ds_cache})"
-    else
-        echo -e "  ${GREEN}✔ DotSlash Executable Binaries:${RESET} Clean (0B)"
-    fi
-
-    # Pip
-    local pip_cache="$HOME/Library/Caches/pip"
-    local pip_sz=$(get_size "$pip_cache")
-    if [[ "$pip_sz" != "0B" ]]; then
-        echo -e "  ${YELLOW}! Python Pip Cache:${RESET} ${BOLD}${pip_sz}${RESET} (${pip_cache})"
-    else
-        echo -e "  ${GREEN}✔ Python Pip Cache:${RESET} Clean (0B)"
-    fi
-
-    # Xcode DerivedData
-    local xcode_dd="$HOME/Library/Developer/Xcode/DerivedData"
-    local xcode_sz=$(get_size "$xcode_dd")
-    if [[ "$xcode_sz" != "0B" ]]; then
-        echo -e "  ${YELLOW}! Xcode DerivedData:${RESET} ${BOLD}${xcode_sz}${RESET} (${xcode_dd})"
-    else
-        echo -e "  ${GREEN}✔ Xcode DerivedData:${RESET} Clean (0B)"
-    fi
-
-    # CoreSimulator Caches
-    local sim_cache="$HOME/Library/Developer/CoreSimulator/Caches"
-    local sim_sz=$(get_size "$sim_cache")
-    if [[ "$sim_sz" != "0B" ]]; then
-        echo -e "  ${YELLOW}! iOS Simulator Caches:${RESET} ${BOLD}${sim_sz}${RESET} (${sim_cache})"
-    else
-        echo -e "  ${GREEN}✔ iOS Simulator Caches:${RESET} Clean (0B)"
-    fi
-
-    # Gradle Caches
-    local gradle_cache="$HOME/.gradle/caches"
-    local gradle_sz=$(get_size "$gradle_cache")
-    if [[ "$gradle_sz" != "0B" ]]; then
-        echo -e "  ${YELLOW}! Gradle Cache:${RESET} ${BOLD}${gradle_sz}${RESET} (${gradle_cache})"
-    else
-        echo -e "  ${GREEN}✔ Gradle Cache:${RESET} Clean (0B)"
-    fi
-
-    echo ""
-
-    # Tier 3: App Virtual Disks & Heavy Caches
-    echo -e "${BOLD}--- [Tier 3: App-Specific Virtual Disks & Heavy Caches] ---${RESET}"
-
-    local bs_path="/Users/Shared/Library/Application Support/BlueStacks"
-    local bs_sz=$(get_size "$bs_path")
-    if [[ "$bs_sz" != "0B" ]]; then
-        echo -e "  ${RED}! BlueStacks Android VM Disk:${RESET} ${BOLD}${bs_sz}${RESET} (${bs_path})"
-    else
-        echo -e "  ${GREEN}✔ BlueStacks Android VM:${RESET} Clean (0B)"
-    fi
-
-    # Adobe Camera Raw
-    local raw1="$HOME/Library/Caches/Adobe Camera Raw 2"
-    local raw2="$HOME/Library/Caches/Adobe Camera Raw BigTableGroupCache"
-    local raw_kb=0
-    [[ -d "$raw1" ]] && raw_kb=$(( raw_kb + $(get_size_kb "$raw1") ))
-    [[ -d "$raw2" ]] && raw_kb=$(( raw_kb + $(get_size_kb "$raw2") ))
-    if [[ $raw_kb -gt 1024 ]]; then
-        echo -e "  ${YELLOW}! Adobe Camera Raw Preview Caches:${RESET} ${BOLD}$(format_kb "$raw_kb")${RESET} (~/Library/Caches/Adobe Camera Raw*)"
-    else
-        echo -e "  ${GREEN}✔ Adobe Camera Raw Caches:${RESET} Clean (0B)"
-    fi
-
-    # Trash
-    local trash_kb=$(get_size_kb "$HOME/.Trash")
-    if [[ $trash_kb -gt 1048576 ]]; then
-        echo -e "  ${YELLOW}! User Trash Bin:${RESET} ${BOLD}$(format_kb "$trash_kb")${RESET} (~/.Trash)"
-    fi
-
-    # Diagnostic Reports
-    local diag_cache="$HOME/Library/Logs/DiagnosticReports"
-    local diag_kb=$(get_size_kb "$diag_cache")
-    if [[ $diag_kb -gt 102400 ]]; then
-        echo -e "  ${YELLOW}! Diagnostic Crash Reports:${RESET} ${BOLD}$(format_kb "$diag_kb")${RESET} (${diag_cache})"
-    fi
-
-    # Docker VM disk (sparse report)
+    # Read-only insights
     local docker_raw="$HOME/Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw"
     if [[ -f "$docker_raw" ]]; then
-        local d_real=$(du -sh "$docker_raw" 2>/dev/null | awk '{print $1}')
-        local d_sparse=$(ls -lh "$docker_raw" 2>/dev/null | awk '{print $5}')
-        echo -e "  ${BLUE}ℹ Docker VM Disk:${RESET} Allocated: ${BOLD}${d_real}${RESET} (Sparse limit: ${d_sparse})"
+        local d_alloc_kb d_sparse
+        d_alloc_kb=$(get_size_kb "$docker_raw")
+        d_sparse=$(ls -lh "$docker_raw" 2>/dev/null | awk '{print $5}')
+        json_insight "docker" "docker-vm" "Docker VM Disk" $(( d_alloc_kb * 1024 )) "$docker_raw" ",\"sparseLimit\":\"$(json_escape "$d_sparse")\""
     fi
 
-    # Prime Video Container
+    local snapshots snap_cnt
+    snapshots=$(tmutil listlocalsnapshots /System/Volumes/Data 2>/dev/null | grep "com.apple.TimeMachine" || true)
+    if [[ -n "$snapshots" ]]; then
+        snap_cnt=$(echo "$snapshots" | wc -l | tr -d ' ')
+        json_insight "snapshots" "apfs-snapshots" "APFS Local Time Machine Snapshots" 0 "" ",\"count\":${snap_cnt}"
+    else
+        json_insight "snapshots" "apfs-snapshots" "APFS Local Time Machine Snapshots" 0 "" ",\"count\":0"
+    fi
+
+    local vm_kb cs_kb
+    vm_kb=$(get_size_kb "/private/var/vm")
+    [[ "$vm_kb" == <-> ]] || vm_kb=0
+    json_insight "vm-swap" "vm-swap" "macOS VM Swap Space" $(( vm_kb * 1024 )) "/private/var/vm" ""
+
+    cs_kb=$(get_size_kb "$HOME/Library/CloudStorage")
+    [[ "$cs_kb" == <-> ]] || cs_kb=0
+    json_insight "cloudstorage" "cloudstorage" "CloudStorage Files" $(( cs_kb * 1024 )) "$HOME/Library/CloudStorage" ""
+
+    # Uncatalogued heavy caches (> 1 GB) — information only
+    if [[ -d "$HOME/Library/Caches" ]]; then
+        local cache_dir c_kb cat_flag
+        for cache_dir in "$HOME/Library/Caches"/*(/N); do
+            c_kb=$(get_size_kb "$cache_dir")
+            [[ "$c_kb" == <-> ]] || c_kb=0
+            (( c_kb > 1048576 )) || continue
+            cat_flag=$(bool 0)
+            if is_catalogued_path "$cache_dir"; then cat_flag=$(bool 1); fi
+            json_insight "heavy-cache" "heavy-cache:$(basename "$cache_dir")" "$(basename "$cache_dir")" \
+                $(( c_kb * 1024 )) "$cache_dir" ",\"catalogued\":${cat_flag}"
+        done
+    fi
+
+    # Spotlight large files — information only
+    local large_files f f_kb cat_flag
+    large_files=$(mdfind "kMDItemFSSize > 1073741824" 2>/dev/null | head -n 5 || true)
+    if [[ -n "$large_files" ]]; then
+        while IFS= read -r f; do
+            [[ -z "$f" ]] && continue
+            f_kb=$(get_size_kb "$f")
+            [[ "$f_kb" == <-> ]] || f_kb=0
+            cat_flag=$(bool 0)
+            if is_catalogued_path "$f"; then cat_flag=$(bool 1); fi
+            json_insight "large-file" "large-file:$(basename "$f")" "$(basename "$f")" \
+                $(( f_kb * 1024 )) "$f" ",\"catalogued\":${cat_flag}"
+        done <<< "$large_files"
+    fi
+
+    json_done_audit "$reclaim_kb" "$reclaim_items" $(( SECONDS * 1000 ))
+}
+
+run_audit() {
+    show_summary
+    say ""
+    say "${BOLD}${CYAN}Auditing System Data Culprits...${RESET}"
+    if [[ -n "$DARWIN_USER_BASE" ]]; then
+        say "${DIM}Darwin base resolved to: ${DARWIN_USER_BASE}${RESET}"
+    fi
+    say ""
+
+    # Tier 1: Runaway Bugs
+    say "${BOLD}--- [Tier 1: Stranded OS & App Bug Dumps (100% Safe to Clean)] ---${RESET}"
+    local clones=(${(f)CAT_PATHS[code-sign-clones]})
+    local active_clones=0
+    local clone
+    for clone in "${clones[@]}"; do
+        [[ -n "$clone" && -d "$clone" ]] || continue
+        local clone_kb
+        clone_kb=$(get_size_kb "$clone")
+        [[ "$clone_kb" == <-> ]] || clone_kb=0
+        (( clone_kb > 0 )) || continue
+        active_clones=$(( active_clones + 1 ))
+        say "  ${RED}! Runaway Code-Sign Clones ($(clone_label "$clone")):${RESET} ${BOLD}$(format_kb "$clone_kb")${RESET} (${clone})"
+    done
+    if [[ $active_clones -eq 0 ]]; then
+        say "  ${GREEN}✔ Chromium / Electron Code-Sign Clones:${RESET} Clean (0B)"
+    fi
+    print_item_line "appstore-staging"
+    say ""
+
+    # Tier 2: Developer & Package Manager Caches
+    say "${BOLD}--- [Tier 2: Developer & Package Manager Caches] ---${RESET}"
+    local id
+    for id in "${CATALOG_IDS[@]}"; do
+        [[ ${CAT_TIER[$id]} -eq 2 ]] || continue
+        print_item_line "$id"
+    done
+    say ""
+
+    # Tier 3: App Virtual Disks & Heavy Caches
+    say "${BOLD}--- [Tier 3: App-Specific Virtual Disks & Heavy Caches] ---${RESET}"
+    for id in bluestacks adobe-raw trash diagnostic-reports; do
+        print_item_line "$id"
+    done
+
+    local docker_raw="$HOME/Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw"
+    if [[ -f "$docker_raw" ]]; then
+        local d_real d_sparse
+        d_real=$(du -sh "$docker_raw" 2>/dev/null | awk '{print $1}')
+        d_sparse=$(ls -lh "$docker_raw" 2>/dev/null | awk '{print $5}')
+        say "  ${BLUE}ℹ Docker VM Disk:${RESET} Allocated: ${BOLD}${d_real}${RESET} (Sparse limit: ${d_sparse})"
+    fi
+
     local pv_container="$HOME/Library/Containers/com.amazon.aiv.AIVApp"
     if [[ -d "$pv_container" ]]; then
-        echo -e "  ${BLUE}ℹ Leftover Prime Video Container:${RESET} Present (${pv_container})"
+        say "  ${BLUE}ℹ Leftover Prime Video Container:${RESET} Present (${pv_container})"
     fi
-
-    echo ""
+    say ""
 
     # Dynamic inspection of giant caches in ~/Library/Caches (> 1 GB)
-    echo -e "${BOLD}--- [Heavy Caches in ~/Library/Caches (> 1 GB)] ---${RESET}"
-    local heavy_caches_found=0
+    say "${BOLD}--- [Heavy Caches in ~/Library/Caches (> 1 GB)] ---${RESET}"
+    local heavy_caches_found=0 cache_dir c_kb
     if [[ -d "$HOME/Library/Caches" ]]; then
         for cache_dir in "$HOME/Library/Caches"/*(/N); do
-            local c_kb=$(get_size_kb "$cache_dir")
-            if [[ $c_kb -gt 1048576 ]]; then
+            c_kb=$(get_size_kb "$cache_dir")
+            [[ "$c_kb" == <-> ]] || c_kb=0
+            if (( c_kb > 1048576 )); then
                 heavy_caches_found=1
-                echo -e "  ${DIM}$(format_kb "$c_kb")${RESET}  ${cache_dir}"
+                say "  ${DIM}$(format_kb "$c_kb")${RESET}  ${cache_dir}"
             fi
         done
     fi
     if [[ $heavy_caches_found -eq 0 ]]; then
-        echo -e "  ${DIM}No uncataloged directories exceeding 1 GB found in ~/Library/Caches.${RESET}"
+        say "  ${DIM}No uncataloged directories exceeding 1 GB found in ~/Library/Caches.${RESET}"
     fi
-
-    echo ""
+    say ""
 
     # Tier 4: System Insights
-    echo -e "${BOLD}--- [Tier 4: System Insights & Read-Only Diagnostics] ---${RESET}"
-
-    # APFS Snapshots
-    local snapshots
+    say "${BOLD}--- [Tier 4: System Insights & Read-Only Diagnostics] ---${RESET}"
+    local snapshots snap_cnt
     snapshots=$(tmutil listlocalsnapshots /System/Volumes/Data 2>/dev/null | grep "com.apple.TimeMachine" || true)
     if [[ -n "$snapshots" ]]; then
-        local snap_cnt=$(echo "$snapshots" | wc -l | tr -d ' ')
-        echo -e "  ${YELLOW}! APFS Local Time Machine Snapshots:${RESET} ${snap_cnt} snapshot(s) active"
-        echo -e "    ${DIM}Prune with: tmutil thinlocalsnapshots /System/Volumes/Data 10000000000 4${RESET}"
+        snap_cnt=$(echo "$snapshots" | wc -l | tr -d ' ')
+        say "  ${YELLOW}! APFS Local Time Machine Snapshots:${RESET} ${snap_cnt} snapshot(s) active"
+        say "    ${DIM}Prune with: tmutil thinlocalsnapshots /System/Volumes/Data 10000000000 4${RESET}"
     else
-        echo -e "  ${GREEN}✔ APFS Local Snapshots:${RESET} None active"
+        say "  ${GREEN}✔ APFS Local Snapshots:${RESET} None active"
     fi
 
-    # VM Swap
-    local vm_sz=$(get_size "/private/var/vm")
-    echo -e "  ${BLUE}ℹ macOS VM Swap Space:${RESET} ${vm_sz} (/private/var/vm)"
-
-    # CloudStorage
-    local cs_sz=$(get_size "$HOME/Library/CloudStorage")
-    echo -e "  ${BLUE}ℹ CloudStorage Files:${RESET} ${cs_sz} (~/Library/CloudStorage)"
-
-    echo ""
+    local vm_sz cs_sz
+    vm_sz=$(get_size "/private/var/vm")
+    say "  ${BLUE}ℹ macOS VM Swap Space:${RESET} ${vm_sz} (/private/var/vm)"
+    cs_sz=$(get_size "$HOME/Library/CloudStorage")
+    say "  ${BLUE}ℹ CloudStorage Files:${RESET} ${cs_sz} (~/Library/CloudStorage)"
+    say ""
 
     # Spotlight Large Files
-    echo -e "${BOLD}--- [Spotlight: Top Files Greater Than 1 GB] ---${RESET}"
-    local large_files
+    say "${BOLD}--- [Spotlight: Top Files Greater Than 1 GB] ---${RESET}"
+    local large_files f sz
     large_files=$(mdfind "kMDItemFSSize > 1073741824" 2>/dev/null | head -n 5 || true)
     if [[ -n "$large_files" ]]; then
-        local sz
         while IFS= read -r f; do
             [[ -z "$f" ]] && continue
-            sz=$(du -sh "$f" 2>/dev/null | awk '{print $1}')
-            echo -e "  ${DIM}${sz}${RESET}  $f"
+            sz=$(get_size "$f")
+            say "  ${DIM}${sz}${RESET}  $f"
         done <<< "$large_files"
     else
-        echo -e "  ${DIM}No large files indexed > 1 GB.${RESET}"
+        say "  ${DIM}No large files indexed > 1 GB.${RESET}"
     fi
 
-    echo ""
-    echo -e "${BOLD}${GREEN}Audit complete.${RESET} To clean bloated items, run: ${CYAN}macos-system-data --clean${RESET}"
+    say ""
+    say "${BOLD}${GREEN}Audit complete.${RESET} To clean bloated items, run: ${CYAN}macos-system-data --clean${RESET}"
 }
 
 # ------------------------------------------------------------------------------
 # CLEAN ACTIONS
 # ------------------------------------------------------------------------------
 
-clean_tier1() {
-    echo -e "${BOLD}${CYAN}Cleaning Tier 1: Stranded OS & App Bug Dumps...${RESET}"
-    
-    if [[ -d "$DARWIN_DIR_X" ]]; then
-        while IFS= read -r clone; do
-            if [[ -n "$clone" && -d "$clone" ]]; then
-                safe_remove "$clone" "Code-Sign Clone ($(basename "$clone"))"
-            fi
-        done < <(find "$DARWIN_DIR_X" -maxdepth 1 -name "*.code_sign_clone" 2>/dev/null)
+clean_paths() {
+    local id="$1" p
+    for p in ${(f)CAT_PATHS[$id]}; do
+        [[ -n "$p" && -e "$p" ]] || continue
+        safe_remove "$p" "${CAT_LABEL[$id]}"
+    done
+}
+
+clean_clones() {
+    local p
+    for p in ${(f)CAT_PATHS[code-sign-clones]}; do
+        [[ -n "$p" && -d "$p" ]] || continue
+        safe_remove "$p" "Code-Sign Clone ($(clone_label "$p"))"
+    done
+}
+
+clean_trash() {
+    local item
+    for item in "$HOME"/.Trash/*(D); do
+        [[ -e "$item" ]] || continue
+        safe_remove "$item" "Trash Item: $(basename "$item")"
+    done
+}
+
+confirm_review() {
+    local id="$1" sz="$2"
+    case "$id" in
+        bluestacks) confirm_action "Delete BlueStacks Android VM disk (${sz})?" ;;
+        adobe-raw) confirm_action "Clear Adobe Camera Raw preview caches?" ;;
+        diagnostic-reports) confirm_action "Purge old diagnostic crash reports (${sz})?" ;;
+        trash) confirm_action "Empty User Trash bin (${sz})?" ;;
+        prime-video-container) confirm_action "Purge leftover Prime Video container?" ;;
+        *) return 0 ;;
+    esac
+}
+
+# Cleans a single catalog item and reports the result (text or JSON).
+clean_one() {
+    local id="$1"
+    if [[ -z "${CAT_TIER[$id]}" ]]; then
+        echo "Error: unknown item ID '${id}'" >&2
+        return 1
     fi
 
-    local appstore="${DARWIN_DIR_C}/com.apple.appstoreagent"
-    if [[ -d "$appstore" ]]; then
-        safe_remove "$appstore" "App Store Download Cache"
+    measure_item "$id"
+    local before=$ITEM_KB
+    local state
+    state=$(item_state "$id")
+    local label="${CAT_LABEL[$id]}"
+
+    if [[ "$state" == "missing" || $before -eq 0 ]]; then
+        json_clean "$id" "missing" 0 ""
+        return 0
     fi
+
+    if [[ "$state" == "denied" ]]; then
+        LAST_ERROR="Permission denied (Full Disk Access may be required)"
+        json_clean "$id" "failed" 0 "$LAST_ERROR"
+        CLEAN_FAILURES=$(( CLEAN_FAILURES + 1 ))
+        say "  ${RED}✘ ${label}:${RESET} permission denied"
+        return 1
+    fi
+
+    if [[ "${CAT_SAFETY[$id]}" == "review" && $FORCE -eq 0 && $DRY_RUN -eq 0 ]]; then
+        if ! confirm_review "$id" "$(format_kb "$before")"; then
+            json_clean "$id" "skipped" 0 "declined"
+            return 0
+        fi
+    fi
+
+    LAST_ERROR=""
+    case "${CAT_HANDLER[$id]}" in
+        clones) clean_clones ;;
+        trash) clean_trash ;;
+        *) clean_paths "$id" ;;
+    esac
+
+    local after result reclaimed
+    if [[ $DRY_RUN -eq 1 ]]; then
+        after=$before
+        result="would-clean"
+        reclaimed=$before
+    else
+        measure_item "$id"
+        after=$ITEM_KB
+        reclaimed=$(( before - after ))
+        (( reclaimed < 0 )) && reclaimed=0
+        if [[ $after -eq 0 ]]; then
+            result="cleaned"
+        elif [[ $reclaimed -gt 0 ]]; then
+            result="partial"
+            CLEAN_FAILURES=$(( CLEAN_FAILURES + 1 ))
+        else
+            result="failed"
+            CLEAN_FAILURES=$(( CLEAN_FAILURES + 1 ))
+        fi
+    fi
+
+    json_clean "$id" "$result" "$reclaimed" "$LAST_ERROR"
+    return 0
+}
+
+clean_tier1() {
+    say "${BOLD}${CYAN}Cleaning Tier 1: Stranded OS & App Bug Dumps...${RESET}"
+    clean_one "code-sign-clones"
+    clean_one "appstore-staging"
 }
 
 clean_tier2() {
-    echo -e "${BOLD}${CYAN}Cleaning Tier 2: Developer & Package Caches...${RESET}"
-
-    if [[ -d "$HOME/.npm/_cacache" || -d "$HOME/.npm/_npx" ]]; then
-        safe_remove "$HOME/.npm/_cacache" "NPM Download Cache"
-        safe_remove "$HOME/.npm/_npx" "NPX Temporary Binaries"
-    fi
-
-    local brew_cache="$HOME/Library/Caches/Homebrew"
-    if [[ -d "$brew_cache" ]]; then
-        safe_remove "$brew_cache" "Homebrew Bottle Cache"
-    fi
-
-    local pw_cache="$HOME/Library/Caches/ms-playwright"
-    if [[ -d "$pw_cache" ]]; then
-        safe_remove "$pw_cache" "Playwright Browser Binaries"
-    fi
-    local pw_go="$HOME/Library/Caches/ms-playwright-go"
-    if [[ -d "$pw_go" ]]; then
-        safe_remove "$pw_go" "Playwright Go Binaries"
-    fi
-
-    local ds_cache="$HOME/Library/Caches/dotslash"
-    if [[ -d "$ds_cache" ]]; then
-        safe_remove "$ds_cache" "DotSlash Executable Cache"
-    fi
-
-    local pip_cache="$HOME/Library/Caches/pip"
-    if [[ -d "$pip_cache" ]]; then
-        safe_remove "$pip_cache" "Pip Download Cache"
-    fi
-
-    local xcode_dd="$HOME/Library/Developer/Xcode/DerivedData"
-    if [[ -d "$xcode_dd" ]]; then
-        safe_remove "$xcode_dd" "Xcode DerivedData"
-    fi
-
-    local sim_cache="$HOME/Library/Developer/CoreSimulator/Caches"
-    if [[ -d "$sim_cache" ]]; then
-        safe_remove "$sim_cache" "iOS Simulator Caches"
-    fi
-
-    local gradle_cache="$HOME/.gradle/caches"
-    if [[ -d "$gradle_cache" ]]; then
-        safe_remove "$gradle_cache" "Gradle Cache"
-    fi
-
-    local yarn_cache="$HOME/Library/Caches/Yarn"
-    if [[ -d "$yarn_cache" ]]; then
-        safe_remove "$yarn_cache" "Yarn Cache"
-    fi
-
-    local cocoapods="$HOME/Library/Caches/CocoaPods"
-    if [[ -d "$cocoapods" ]]; then
-        safe_remove "$cocoapods" "CocoaPods Cache"
-    fi
+    say "${BOLD}${CYAN}Cleaning Tier 2: Developer & Package Caches...${RESET}"
+    local id
+    for id in "${CATALOG_IDS[@]}"; do
+        [[ ${CAT_TIER[$id]} -eq 2 ]] || continue
+        clean_one "$id"
+    done
 }
 
 clean_tier3() {
-    echo -e "${BOLD}${CYAN}Reviewing Tier 3: App-Specific Virtual Disks & Caches...${RESET}"
-
-    local bs_path="/Users/Shared/Library/Application Support/BlueStacks"
-    if [[ -d "$bs_path" ]]; then
-        local bs_sz=$(get_size "$bs_path")
-        if confirm_action "Delete BlueStacks Android VM disk (${bs_sz})?"; then
-            safe_remove "$bs_path" "BlueStacks Android VM"
-        fi
-    fi
-
-    local raw1="$HOME/Library/Caches/Adobe Camera Raw 2"
-    local raw2="$HOME/Library/Caches/Adobe Camera Raw BigTableGroupCache"
-    if [[ -d "$raw1" || -d "$raw2" ]]; then
-        if confirm_action "Clear Adobe Camera Raw preview caches?"; then
-            [[ -d "$raw1" ]] && safe_remove "$raw1" "Adobe Camera Raw Cache"
-            [[ -d "$raw2" ]] && safe_remove "$raw2" "Adobe Camera Raw BigTable Cache"
-        fi
-    fi
-
-    local diag_cache="$HOME/Library/Logs/DiagnosticReports"
-    if [[ -d "$diag_cache" ]]; then
-        local diag_sz=$(get_size "$diag_cache")
-        if confirm_action "Purge old diagnostic crash reports (${diag_sz})?"; then
-            safe_remove "$diag_cache" "Diagnostic Crash Reports"
-        fi
-    fi
-
-    local trash_path="$HOME/.Trash"
-    local trash_kb=$(get_size_kb "$trash_path")
-    if [[ $trash_kb -gt 1048576 ]]; then
-        local trash_human=$(format_kb "$trash_kb")
-        if confirm_action "Empty User Trash bin (${trash_human})?"; then
-            for item in "$trash_path"/*(D); do
-                [[ -e "$item" ]] && safe_remove "$item" "Trash Item: $(basename "$item")"
-            done
-        fi
-    fi
-
-    local pv_container="$HOME/Library/Containers/com.amazon.aiv.AIVApp"
-    if [[ -d "$pv_container" ]]; then
-        if confirm_action "Purge leftover Prime Video container?"; then
-            safe_remove "$pv_container" "Prime Video Container"
-        fi
-    fi
+    say "${BOLD}${CYAN}Reviewing Tier 3: App-Specific Virtual Disks & Caches...${RESET}"
+    local id
+    for id in bluestacks adobe-raw diagnostic-reports trash prime-video-container; do
+        clean_one "$id"
+    done
 }
 
 print_cleanup_summary() {
-    echo ""
-    local human_total=$(format_kb "$TOTAL_RECLAIMED_KB")
-    if [[ $DRY_RUN -eq 1 ]]; then
-        echo -e "${BOLD}${YELLOW}Dry run complete.${RESET} Estimated space reclaimable: ${BOLD}${human_total}${RESET}"
-    else
-        echo -e "${BOLD}${GREEN}✔ Cleanup complete!${RESET} Total space reclaimed: ${BOLD}${human_total}${RESET}"
+    if [[ $JSON_MODE -eq 1 ]]; then
+        json_done_clean "$TOTAL_RECLAIMED_KB" "$CLEAN_FAILURES"
+        return 0
     fi
-    echo ""
+    say ""
+    local human_total
+    human_total=$(format_kb "$TOTAL_RECLAIMED_KB")
+    if [[ $DRY_RUN -eq 1 ]]; then
+        say "${BOLD}${YELLOW}Dry run complete.${RESET} Estimated space reclaimable: ${BOLD}${human_total}${RESET}"
+    else
+        say "${BOLD}${GREEN}✔ Cleanup complete!${RESET} Total space reclaimed: ${BOLD}${human_total}${RESET}"
+    fi
+    say ""
     show_summary
+}
+
+run_clean_ids() {
+    local -a ids=(${(s:,:)CLEAN_IDS})
+    local id clean_ids=() seen=0
+
+    for id in "${ids[@]}"; do
+        id="${id// /}"
+        [[ -z "$id" ]] && continue
+        if [[ -z "${CAT_TIER[$id]}" ]]; then
+            echo "Error: unknown item ID '${id}'" >&2
+            echo "Valid IDs: ${(j:, :)CATALOG_IDS}" >&2
+            exit 2
+        fi
+        if [[ ${CAT_CLEANABLE[$id]} -ne 1 ]]; then
+            echo "Error: item '${id}' is read-only and cannot be cleaned" >&2
+            exit 2
+        fi
+        clean_ids+=("$id")
+        seen=1
+    done
+
+    if [[ $seen -eq 0 ]]; then
+        echo "Error: --clean-ids received no valid IDs" >&2
+        exit 2
+    fi
+
+    # Non-interactive by design: require an explicit consent flag when not previewing.
+    if [[ $DRY_RUN -eq 0 && $FORCE -eq 0 ]]; then
+        echo "Error: --clean-ids is non-interactive; pass -y to delete or -n to preview" >&2
+        exit 2
+    fi
+
+    [[ $JSON_MODE -eq 1 ]] && json_meta "clean-ids"
+    for id in "${clean_ids[@]}"; do
+        clean_one "$id"
+    done
+    print_cleanup_summary
+
+    (( CLEAN_FAILURES > 0 )) && exit 3
+    exit 0
 }
 
 # ------------------------------------------------------------------------------
@@ -659,40 +988,78 @@ print_cleanup_summary() {
 # ------------------------------------------------------------------------------
 
 case "$MODE" in
+    summary)
+        if [[ $JSON_MODE -eq 1 ]]; then
+            json_meta "summary"
+            json_disk
+            print -r -- "{\"type\":\"done\",\"reclaimableBytes\":0,\"reclaimableItems\":0}"
+        else
+            show_summary
+        fi
+        exit 0
+        ;;
     audit)
-        run_audit
+        if [[ $JSON_MODE -eq 1 ]]; then
+            run_audit_json
+        else
+            run_audit
+        fi
+        exit 0
+        ;;
+    clean-ids)
+        run_clean_ids
         ;;
     clean-tier1)
+        if [[ $JSON_MODE -eq 1 ]]; then json_meta "clean-tier1"; fi
         clean_tier1
         print_cleanup_summary
+        if (( CLEAN_FAILURES > 0 )); then exit 3; fi
+        exit 0
         ;;
     clean-dev)
+        if [[ $JSON_MODE -eq 1 ]]; then json_meta "clean-dev"; fi
         clean_tier2
         print_cleanup_summary
+        if (( CLEAN_FAILURES > 0 )); then exit 3; fi
+        exit 0
         ;;
     clean-all)
+        if [[ $JSON_MODE -eq 1 && $FORCE -eq 0 ]]; then
+            echo "Error: --json with --clean-all requires --force (no interactive prompts)" >&2
+            exit 2
+        fi
+        if [[ $JSON_MODE -eq 1 ]]; then json_meta "clean-all"; fi
         clean_tier1
         clean_tier2
         clean_tier3
         print_cleanup_summary
+        if (( CLEAN_FAILURES > 0 )); then exit 3; fi
+        exit 0
         ;;
     clean)
-        echo -e "${BOLD}${CYAN}=== Interactive System Data Cleanup ===${RESET}"
-        if [[ $DRY_RUN -eq 1 ]]; then
-            echo -e "${YELLOW}[DRY RUN MODE ENABLED - No files will be modified]${RESET}"
+        if [[ $JSON_MODE -eq 1 && $FORCE -eq 0 ]]; then
+            echo "Error: --json with --clean requires --force (no interactive prompts)" >&2
+            exit 2
         fi
-        echo ""
-        if confirm_action "Clean Tier 1 (Stranded update bug clones, AppStore staging)?"; then
+        if [[ $JSON_MODE -eq 1 ]]; then json_meta "clean"; fi
+        say "${BOLD}${CYAN}=== Interactive System Data Cleanup ===${RESET}"
+        if [[ $DRY_RUN -eq 1 ]]; then
+            say "${YELLOW}[DRY RUN MODE ENABLED - No files will be modified]${RESET}"
+        fi
+        say ""
+        if [[ $FORCE -eq 1 ]] || confirm_action "Clean Tier 1 (Stranded update bug clones, AppStore staging)?"; then
             clean_tier1
         fi
-        echo ""
-        if confirm_action "Clean Tier 2 (Developer NPM, Brew, Playwright, Xcode, Pip caches)?"; then
+        say ""
+        if [[ $FORCE -eq 1 ]] || confirm_action "Clean Tier 2 (Developer NPM, Brew, Playwright, Xcode, Pip caches)?"; then
             clean_tier2
         fi
-        echo ""
-        if confirm_action "Review and clean Tier 3 (Virtual Disks, Adobe Camera Raw, Trash, Crash Logs)?"; then
+        say ""
+        if [[ $FORCE -eq 1 ]] || confirm_action "Review and clean Tier 3 (Virtual Disks, Adobe Camera Raw, Trash, Crash Logs)?"; then
             clean_tier3
         fi
         print_cleanup_summary
+        if (( CLEAN_FAILURES > 0 )); then exit 3; fi
+        exit 0
         ;;
 esac
